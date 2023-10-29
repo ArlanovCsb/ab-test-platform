@@ -1,6 +1,6 @@
 version: '3.5'
 services:
-  knrn-questions-nint-system:
+  ab-test-platform:
     build:
       context: .
       dockerfile: Dockerfile
