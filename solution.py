@@ -1,7 +1,7 @@
 import os
 import json
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,7 @@ from flask import Flask, jsonify, request
 df_users = pd.read_csv(os.environ['PATH_DF_USERS'])
 df_sales = pd.read_csv(os.environ['PATH_DF_SALES'])
 
+# убираем выбросы
 df_sales = df_sales[
     df_sales['sales'] < 5000
     ]
@@ -21,6 +22,7 @@ df_sales_test = df_sales[
     df_sales['day'].isin(np.arange(49, 56))
 ]
 
+# строим QUPED
 df_sales_before = df_sales[
     df_sales['day'].isin(np.arange(28, 49))
 ]
@@ -29,7 +31,6 @@ df_sales_before = df_sales[
 bins = np.linspace(15, 65, 6).astype(int)
 df_users['age_bin'] = pd.cut(df_users.age, bins=bins)
 stratum = df_users.groupby(['gender', 'age_bin']).user_id.count() / len(df_users)
-
 
 app = Flask(__name__)
 
@@ -42,11 +43,11 @@ def ping():
 @app.route('/check_test', methods=['POST'])
 def check_test():
     test = json.loads(request.json)['test']
-    has_effect = _check_test(test)
+    has_effect = _check_test(test, True)
     return jsonify(has_effect=int(has_effect))
 
 
-def _check_test(test):
+def _check_test(test, is_ratio=False):
     group_a_one = test['group_a_one']
     group_a_two = test['group_a_two']
     group_b = test['group_b']
@@ -54,8 +55,29 @@ def _check_test(test):
     user_a = group_a_one + group_a_two
     user_b = group_b
 
-    a = get_covariate_df(df_sales_test, df_sales_before, user_a, 'user_id', 'sales', 'sales_cov')
-    b = get_covariate_df(df_sales_test, df_sales_before, user_b, 'user_id', 'sales', 'sales_cov')
+    pvalue = calculate_p_value(df_sales_test, df_sales_before, group_a_one, group_a_two, is_ratio)
+    if pvalue < 0.05:
+        return False
+    pvalue = calculate_p_value(df_sales_test, df_sales_before, user_a, user_b, is_ratio)
+
+    return pvalue < 0.05
+
+
+def calculate_p_value(df_test: pd.DataFrame, df_before: pd.DataFrame, user_a_list: List, user_b_list: List,
+                      is_ratio: bool):
+    if is_ratio:
+        a, coef = calculate_linearization_metric(df_test, user_a_list, 'user_id', 'sales')
+        a_before, coef_before = calculate_linearization_metric(df_before, user_a_list, 'user_id', 'sales')
+        b, _ = calculate_linearization_metric(df_test, user_b_list, 'user_id', 'sales', coef)
+        b_before, _ = calculate_linearization_metric(df_before, user_b_list, 'user_id', 'sales', coef_before)
+    else:
+        a = calculate_users_metric(df_test, user_a_list, 'user_id', 'sales')
+        a_before = calculate_users_metric(df_before, user_a_list, 'user_id', 'sales')
+        b = calculate_users_metric(df_test, user_b_list, 'user_id', 'sales')
+        b_before = calculate_users_metric(df_before, user_b_list, 'user_id', 'sales')
+
+    a = get_covariate_df(a, a_before, 'user_id', 'sales', 'sales_cov')
+    b = get_covariate_df(b, b_before, 'user_id', 'sales', 'sales_cov')
 
     a['sales_cuped'], b['sales_cuped'] = calculate_quped_metric(a, b, 'sales', 'sales_cov')
 
@@ -65,8 +87,7 @@ def _check_test(test):
     delta = a_mean - b_mean
     std = np.sqrt(a_var / len(a) + b_var / len(b))
     statistic = delta / std
-    pvalue = (1 - norm.cdf(np.abs(statistic))) * 2
-    return pvalue < 0.05
+    return (1 - norm.cdf(np.abs(statistic))) * 2
 
 
 def calculate_theta(y_control, y_pilot, y_control_cov, y_pilot_cov) -> float:
@@ -85,21 +106,19 @@ def calculate_theta(y_control, y_pilot, y_control_cov, y_pilot_cov) -> float:
     return theta
 
 
-def calculate_users_metrics(df: pd.DataFrame, user_list: List, user_column: str, metric_name: str) -> pd.DataFrame:
+def calculate_users_metric(df: pd.DataFrame, user_list: List, user_column: str, metric_name: str) -> pd.DataFrame:
     sales = df[
         df[user_column].isin(user_list)
-    ]
+    ].copy()
     result = sales.groupby(user_column, as_index=False)[metric_name].sum()
     return result
 
 
-def get_covariate_df(df, df_before, user_list: List, user_column: str, metric_name, renamed_metric_name: str) \
+def get_covariate_df(df, df_before, user_column: str, metric_name, renamed_metric_name: str) \
         -> pd.DataFrame:
-    result = calculate_users_metrics(df, user_list, user_column, metric_name)
-    cov = calculate_users_metrics(df_before, user_list, user_column, metric_name)
-    cov.rename(columns={metric_name: renamed_metric_name}, inplace=True)
-    result = result.merge(cov, how='left', on=user_column)
-    return result
+    df_before.rename(columns={metric_name: renamed_metric_name}, inplace=True)
+    df = df.merge(df_before, how='left', on=user_column)
+    return df
 
 
 def calculate_quped_metric(a: pd.DataFrame, b: pd.DataFrame, metric_name: str, cov_metric_name: str) \
@@ -116,33 +135,24 @@ def calculate_quped_metric(a: pd.DataFrame, b: pd.DataFrame, metric_name: str, c
 
 
 def calculate_stratified_metrics(df: pd.DataFrame, user_column: str, metric_name: str, stratified_columns: List,
-                           stratum: pd.Series):
+                                 stratum: pd.Series):
     df = df.merge(df_users, how='left', on=user_column)
     avg = (df.groupby(stratified_columns)[metric_name].mean() * stratum).sum()
     var = (df.groupby(stratified_columns)[metric_name].var() * stratum).sum()
     return avg, var
 
 
-# def _check_test(test):
-#     group_a_one = test['group_a_one']
-#     group_a_two = test['group_a_two']
-#     group_b = test['group_b']
-#
-#     user_a = group_a_one + group_a_two
-#     user_b = group_b
-#
-#     sales_a = df_sales_test[
-#         df_sales['user_id'].isin(user_a)
-#     ]
-#     a_x = sales_a.groupby('user_id').sales.sum()
-#     a_y = sales_a.groupby('user_id').sales.count()
-#     coef = np.sum(a_x) / np.sum(a_y)
-#     a_lin = a_x - coef * a_y
-#     sales_b = df_sales_test[
-#         df_sales['user_id'].isin(user_b)
-#     ]
-#     b_x = sales_b.groupby('user_id').sales.sum()
-#     b_y = sales_b.groupby('user_id').sales.count()
-#     b_lin = b_x - coef * b_y
-#
-#     return ttest_ind(a_lin, b_lin)[1] < 0.05
+def calculate_linearization_metric(df: pd.DataFrame, user_list: List, user_column: str, metric_name: str,
+                                   coef: Optional[float] = None) -> Tuple[pd.DataFrame, float]:
+    sales = df[
+        df[user_column].isin(user_list)
+    ].copy()
+    x = sales.groupby(user_column)[metric_name].sum()
+    y = sales.groupby(user_column)[metric_name].count()
+    if coef is None:
+        coef = np.sum(x) / np.sum(y)
+    lin = x - coef * y
+    lin = lin.reset_index()
+    lin.columns = [user_column, metric_name]
+    return lin, coef
+
