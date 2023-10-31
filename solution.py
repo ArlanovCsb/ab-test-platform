@@ -1,321 +1,158 @@
-from argparse import ArgumentParser
-from collections import OrderedDict
-import logging
 import os
-import string
-import sys
+import json
+import time
+from typing import List, Tuple, Optional
 
-from typing import Dict, List, Tuple, Optional
-
-import faiss
-from flask import Flask, json, request, Response, jsonify
-from langdetect import detect
-import nltk
 import numpy as np
-import torch
-import torch.nn.functional as F
+import pandas as pd
+from scipy.stats import ttest_ind, norm
+from flask import Flask, jsonify, request
 
-logger = logging.getLogger(__name__)
-LOG_LEVEL = 'INFO'
-logger.setLevel(LOG_LEVEL)
-logger.addHandler(logging.StreamHandler(sys.stdout))
+# получить данные о пользователях и их покупках
+df_users = pd.read_csv(os.environ['PATH_DF_USERS'])
+df_sales = pd.read_csv(os.environ['PATH_DF_SALES'])
+
+# убираем выбросы
+df_sales = df_sales[
+    df_sales['sales'] < 5000
+    ]
+
+# эксперимент проводился с 49 до 55 день включительно
+df_sales_test = df_sales[
+    df_sales['day'].isin(np.arange(49, 56))
+]
+
+# строим QUPED
+df_sales_before = df_sales[
+    df_sales['day'].isin(np.arange(28, 49))
+]
+
+# получим страты
+bins = np.linspace(15, 65, 6).astype(int)
+df_users['age_bin'] = pd.cut(df_users.age, bins=bins)
+stratum = df_users.groupby(['gender', 'age_bin']).user_id.count() / len(df_users)
 
 app = Flask(__name__)
-app.config['JSON_AS_ASCII'] = False
-
-parser = ArgumentParser(description='Get the port')
-parser.add_argument('--port', type=str, required=False, default=5000,
-                    help='Prediction REST server port')
-args, _ = parser.parse_known_args()
-PORT = args.port
-HOST = '0.0.0.0'
-
-
-class GaussianKernel(torch.nn.Module):
-    def __init__(self, mu: float = 1., sigma: float = 1.):
-        super().__init__()
-        self.mu = mu
-        self.sigma = sigma
-
-    def forward(self, x):
-        return torch.exp(
-            -0.5 * ((x - self.mu) ** 2) / (self.sigma ** 2)
-        )
-
-
-class KNRM(torch.nn.Module):
-    def __init__(self, embedding_matrix: torch.Tensor, freeze_embeddings: bool, kernel_num: int = 21,
-                 sigma: float = 0.1, exact_sigma: float = 0.001,
-                 out_layers: List[int] = [10, 5]):
-        super().__init__()
-        self.embeddings = torch.nn.Embedding.from_pretrained(
-            torch.FloatTensor(embedding_matrix),
-            freeze=freeze_embeddings,
-            padding_idx=0
-        )
-
-        self.kernel_num = kernel_num
-        self.sigma = sigma
-        self.exact_sigma = exact_sigma
-        self.out_layers = out_layers
-
-        self.kernels = self._get_kernels_layers()
-
-        self.mlp = self._get_mlp()
-
-        self.out_activation = torch.nn.Sigmoid()
-
-    def _get_kernels_layers(self) -> torch.nn.ModuleList:
-        kernels = torch.nn.ModuleList()
-        for i in range(self.kernel_num):
-            mu = 1. / (self.kernel_num - 1) + (2. * i) / (
-                    self.kernel_num - 1) - 1.0
-            sigma = self.sigma
-            if mu > 1.0:
-                sigma = self.exact_sigma
-                mu = 1.0
-            kernels.append(GaussianKernel(mu=mu, sigma=sigma))
-        return kernels
-
-    def _get_mlp(self) -> torch.nn.Sequential:
-        out_cont = [self.kernel_num] + self.out_layers + [1]
-        mlp = [
-            torch.nn.Sequential(
-                torch.nn.Linear(in_f, out_f),
-                torch.nn.ReLU()
-            )
-            for in_f, out_f in zip(out_cont, out_cont[1:])
-        ]
-        mlp[-1] = mlp[-1][:-1]
-        return torch.nn.Sequential(*mlp)
-
-    def _get_matching_matrix(self, query: torch.Tensor, doc: torch.Tensor) -> torch.FloatTensor:
-        # shape = [B, L, D]
-        embed_query = self.embeddings(query.long())
-        # shape = [B, R, D]
-        embed_doc = self.embeddings(doc.long())
-
-        # shape = [B, L, R]
-        matching_matrix = torch.einsum(
-            'bld,brd->blr',
-            F.normalize(embed_query, p=2, dim=-1),
-            F.normalize(embed_doc, p=2, dim=-1)
-        )
-        return matching_matrix
-
-    def _apply_kernels(self, matching_matrix: torch.FloatTensor) -> torch.FloatTensor:
-        KM = []
-        for kernel in self.kernels:
-            # shape = [B]
-            K = torch.log1p(kernel(matching_matrix).sum(dim=-1)).sum(dim=-1)
-            KM.append(K)
-
-        # shape = [B, K]
-        kernels_out = torch.stack(KM, dim=1)
-        return kernels_out
-
-    def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.FloatTensor:
-        query, doc = inputs['query'], inputs['document']
-        # shape = [B, L, R]
-        matching_matrix = self._get_matching_matrix(query, doc)
-        # shape [B, K]
-        kernels_out = self._apply_kernels(matching_matrix)
-        # shape [B]
-        out = self.mlp(kernels_out)
-        return out
-
-
-class Solution:
-    def __init__(self,
-                 freeze_knrm_embeddings: bool = True,
-                 knrm_kernel_num: int = 21,
-                 knrm_out_mlp: List[int] = [],
-                 # index_factory_string='IVF2048_HNSW32,Flat',
-                 index_factory_string='IDMap,Flat',
-                 faiss_vector_max_len=30,
-                 k_ann_num=100,
-                 prediction_num=10
-                 ):
-        logger.info("Initialize Solution starting...")
-        self.knrm_emb_matrix_path = os.getenv('EMB_PATH_KNRM')
-        self.vocab_path = os.getenv('VOCAB_PATH')
-        self.mlp_path = os.getenv('MLP_PATH')
-        self.glove_vectors_path = os.getenv('EMB_PATH_GLOVE')
-        self.freeze_knrm_embeddings = freeze_knrm_embeddings
-        self.knrm_kernel_num = knrm_kernel_num
-        self.knrm_out_mlp = knrm_out_mlp
-        self._load_mlp_model()
-        self._load_vocab()
-        self._load_glove_vectors()
-        self.index_factory_string = index_factory_string
-        self.words_text_max_len = faiss_vector_max_len
-        self.k_ann_num = k_ann_num
-        self.prediction_num = prediction_num
-        self.faiss_index = None
-        self.docs_database = None
-        logger.info("Initialized Solution")
-
-    def _load_mlp_model(self):
-        emb_matrix = torch.load(self.knrm_emb_matrix_path)['weight']
-        self.emb_dimention = emb_matrix.shape[1]
-        self.mlp = KNRM(emb_matrix, self.freeze_knrm_embeddings, self.knrm_kernel_num, out_layers=[])
-        mlp_state = torch.load(self.mlp_path)
-        logger.debug(f'Embeding dimention is {self.emb_dimention}')
-        new_state_dict = OrderedDict()
-        new_state_dict['embeddings.weight'] = emb_matrix
-        new_state_dict['mlp.0.0.weight'] = mlp_state['0.0.weight']
-        new_state_dict['mlp.0.0.bias'] = mlp_state['0.0.bias']
-        self.mlp.load_state_dict(new_state_dict)
-        logger.info("Loaded MLP object")
-        logger.debug(self.mlp.eval())
-
-    def _load_vocab(self):
-        with open(self.vocab_path, 'r', encoding='utf-8') as f:
-            self.vocab = json.load(f)
-        logger.info("Loaded vocab")
-
-    def _load_glove_vectors(self):
-        self.embedding_data = {}
-        with open(self.glove_vectors_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                current_line = line.rstrip().split(' ')
-                self.embedding_data[current_line[0]] = current_line[1:]
-        logger.info("Loaded GLOVE dict")
-
-    @staticmethod
-    def handle_punctuation(inp_str: str) -> str:
-        inp_str = str(inp_str)
-        for punct in string.punctuation:
-            inp_str = inp_str.replace(punct, ' ')
-        return inp_str
-
-    def simple_preproc(self, inp_str: str):
-        base_str = inp_str.strip().lower()
-        str_wo_punct = self.handle_punctuation(base_str)
-        return nltk.word_tokenize(str_wo_punct)
-
-    def _preproc_one_document(self, doc):
-        p_q = self.simple_preproc(doc)
-        word_emb = [self.embedding_data.get(w) for w in p_q[:self.words_text_max_len]
-                    if self.embedding_data.get(w) is not None]
-        return word_emb
-
-    def _preproc_docs_for_faiss(self) -> Tuple[np.array, np.array]:
-        idxs = []
-        docs_vectors = []
-        for i in self.docs_database.keys():
-            d = self.docs_database[i]
-            word_emb = self._preproc_one_document(d)
-            if len(word_emb) > 0:
-                word_emb = np.array(word_emb, dtype=np.float32)
-                word_emb = word_emb.max(axis=0)
-            else:
-                word_emb = np.zeros(self.emb_dimention, dtype=np.float32)
-            idxs.append(int(i))
-            docs_vectors.append(word_emb)
-        logger.info(f"Documents db was prepared. Len is {len(idxs)}")
-        return np.array(idxs), np.array(docs_vectors)
-
-    def _tokenized_text_to_index(self, tokenized_text: List[str]) -> List[int]:
-        res = [self.vocab.get(i, self.vocab['OOV']) for i in tokenized_text[:self.words_text_max_len]]
-        return res
-
-    def _convert_text_to_token_idxs(self, text: str) -> List[int]:
-        tokenized_text = self.simple_preproc(text)
-        idxs = self._tokenized_text_to_index(tokenized_text)
-        return idxs
-
-    def _preproc_data_for_knrm(self, query: str, docs: np.array) -> Dict[str, torch.LongTensor]:
-        query = torch.LongTensor([self._convert_text_to_token_idxs(query)] * len(docs))
-        max_len = -1
-        p_docs = []
-        for i in docs:
-            if i >= 0:
-                d = self._convert_text_to_token_idxs(self.docs_database[str(i)])
-                p_docs.append(d)
-                max_len = max(len(d), max_len)
-        document = [pd + [0] * (max_len - len(pd)) for pd in p_docs]
-        document = torch.LongTensor(document)
-        result = {'query': query,
-                  'document': document}
-        return result
-
-    def train_faiss_model(self, raw_docs: Dict[str, str]) -> int:
-        self.docs_database = raw_docs
-        idxs, docs_vectors = self._preproc_docs_for_faiss()
-        index = faiss.index_factory(self.emb_dimention, self.index_factory_string)
-        logger.debug('Index train is started...')
-        index.train(docs_vectors)
-        index.add_with_ids(docs_vectors, idxs)
-        logger.debug('Index train has done')
-        self.faiss_index = index
-        return index.ntotal
-
-    def predict(self, queries: List) -> Tuple[List[bool], List[Optional[List[Tuple[str, str]]]]]:
-        lang_check = []
-        suggestions = []
-        with torch.no_grad():
-            self.mlp.eval()
-            for i in range(len(queries)):
-                lc = False
-                sug = None
-                if detect(queries[i]) == 'en':
-                    word_emb = self._preproc_one_document(queries[i])
-                    if len(word_emb) > 0:
-                        word_emb = np.array(word_emb, dtype=np.float32)
-                        word_emb = word_emb.max(axis=0).reshape(1, -1)
-                        _, k_neinborns = self.faiss_index.search(word_emb, self.k_ann_num)
-                        k_neinborns = k_neinborns.squeeze()
-                        inputs = self._preproc_data_for_knrm(queries[i], k_neinborns)
-                        preds = self.mlp(inputs)
-                        if len(preds) > 0:
-                            preds = np.array(preds.squeeze())
-                            logger.debug(f'Query is {queries[i]}')
-                            argsort = np.argsort(preds)[::-1]
-                            argsort = argsort[:self.prediction_num]
-                            pred_idxs = k_neinborns[argsort]
-                            pred = [(str(i), self.docs_database[str(i)]) for i in pred_idxs]
-                            logger.debug(f'Preds is {pred}')
-                            sug = pred
-                            lc = True
-                lang_check.append(lc)
-                suggestions.append(sug)
-            return lang_check, suggestions
-
-
-model = Solution()
 
 
 @app.route('/ping')
 def ping():
-    # return jsonify({'status': 'ok'})
-    response = json.dumps({'status': 'ok'})
-    return Response(response=response, status=200, mimetype="application/json")
+    return jsonify(status='ok')
 
 
-@app.route('/query', methods=['POST'])
-def query():
-    if model.faiss_index is None or not model.faiss_index.is_trained:
-        # return jsonify({'status': 'FAISS is not initialized!'})
-        response = json.dumps({'status': 'FAISS is not initialized!'})
+@app.route('/check_test', methods=['POST'])
+def check_test():
+    test = json.loads(request.json)['test']
+    has_effect = _check_test(test, True)
+    return jsonify(has_effect=int(has_effect))
+
+
+def _check_test(test, is_ratio=False):
+    group_a_one = test['group_a_one']
+    group_a_two = test['group_a_two']
+    group_b = test['group_b']
+
+    user_a = group_a_one + group_a_two
+    user_b = group_b
+
+    pvalue = calculate_p_value(df_sales_test, df_sales_before, group_a_one, group_a_two, is_ratio)
+    if pvalue < 0.05:
+        return False
+    pvalue = calculate_p_value(df_sales_test, df_sales_before, user_a, user_b, is_ratio)
+
+    return pvalue < 0.05
+
+
+def calculate_p_value(df_test: pd.DataFrame, df_before: pd.DataFrame, user_a_list: List, user_b_list: List,
+                      is_ratio: bool):
+    if is_ratio:
+        a, coef = calculate_linearization_metric(df_test, user_a_list, 'user_id', 'sales')
+        a_before, coef_before = calculate_linearization_metric(df_before, user_a_list, 'user_id', 'sales')
+        b, _ = calculate_linearization_metric(df_test, user_b_list, 'user_id', 'sales', coef)
+        b_before, _ = calculate_linearization_metric(df_before, user_b_list, 'user_id', 'sales', coef_before)
     else:
-        # queries = request.get_json()['queries']
-        queries = json.loads(request.json)['queries']
-        lang_check, suggestions = model.predict(queries)
-        # return jsonify({'lang_check': lang_check, 'suggestions': suggestions})
-        response = json.dumps({'lang_check': lang_check, 'suggestions': suggestions})
-    return Response(response=response, status=200, mimetype="application/json")
+        a = calculate_users_metric(df_test, user_a_list, 'user_id', 'sales')
+        a_before = calculate_users_metric(df_before, user_a_list, 'user_id', 'sales')
+        b = calculate_users_metric(df_test, user_b_list, 'user_id', 'sales')
+        b_before = calculate_users_metric(df_before, user_b_list, 'user_id', 'sales')
+
+    a = get_covariate_df(a, a_before, 'user_id', 'sales', 'sales_cov')
+    b = get_covariate_df(b, b_before, 'user_id', 'sales', 'sales_cov')
+
+    a['sales_cuped'], b['sales_cuped'] = calculate_quped_metric(a, b, 'sales', 'sales_cov')
+
+    a_mean, a_var = calculate_stratified_metrics(a, 'user_id', 'sales_cuped', ['gender', 'age_bin'], stratum)
+    b_mean, b_var = calculate_stratified_metrics(b, 'user_id', 'sales_cuped', ['gender', 'age_bin'], stratum)
+
+    delta = a_mean - b_mean
+    std = np.sqrt(a_var / len(a) + b_var / len(b))
+    statistic = delta / std
+    return (1 - norm.cdf(np.abs(statistic))) * 2
 
 
-@app.route('/update_index', methods=['POST'])
-def update_index():
-    # documents = request.get_json()['documents']
-    documents = json.loads(request.json)['documents']
-    index_size = model.train_faiss_model(documents)
-    # return jsonify({'status': 'ok', 'index_size': index_size})
-    response = json.dumps({'status': 'ok', 'index_size': index_size})
-    return Response(response=response, status=200, mimetype="application/json")
+def calculate_theta(y_control, y_pilot, y_control_cov, y_pilot_cov) -> float:
+    """Вычисляем Theta.
+
+    y_control - значения метрики во время пилота на контрольной группе
+    y_pilot - значения метрики во время пилота на пилотной группе
+    y_control_cov - значения ковариант на контрольной группе
+    y_pilot_cov - значения ковариант на пилотной группе
+    """
+    y = np.hstack([y_control, y_pilot])
+    y_cov = np.hstack([y_control_cov, y_pilot_cov])
+    covariance = np.cov(y_cov, y)[0, 1]
+    variance = y_cov.var()
+    theta = covariance / variance
+    return theta
 
 
-if __name__ == '__main__':
-    app.run(host=HOST, port=PORT)
+def calculate_users_metric(df: pd.DataFrame, user_list: List, user_column: str, metric_name: str) -> pd.DataFrame:
+    sales = df[
+        df[user_column].isin(user_list)
+    ].copy()
+    result = sales.groupby(user_column, as_index=False)[metric_name].sum()
+    return result
+
+
+def get_covariate_df(df, df_before, user_column: str, metric_name, renamed_metric_name: str) \
+        -> pd.DataFrame:
+    df_before.rename(columns={metric_name: renamed_metric_name}, inplace=True)
+    df = df.merge(df_before, how='left', on=user_column)
+    return df
+
+
+def calculate_quped_metric(a: pd.DataFrame, b: pd.DataFrame, metric_name: str, cov_metric_name: str) \
+        -> Tuple[np.array, np.array]:
+    y_control = a[metric_name].values
+    y_control_cov = a[cov_metric_name].fillna(0).values
+    y_pilot = b[metric_name].values
+    y_pilot_cov = b[cov_metric_name].fillna(0).values
+
+    theta = calculate_theta(y_control, y_pilot, y_control_cov, y_pilot_cov)
+    a_cuped = y_control - theta * y_control_cov
+    b_cuped = y_pilot - theta * y_pilot_cov
+    return a_cuped, b_cuped
+
+
+def calculate_stratified_metrics(df: pd.DataFrame, user_column: str, metric_name: str, stratified_columns: List,
+                                 stratum: pd.Series):
+    df = df.merge(df_users, how='left', on=user_column)
+    avg = (df.groupby(stratified_columns)[metric_name].mean() * stratum).sum()
+    var = (df.groupby(stratified_columns)[metric_name].var() * stratum).sum()
+    return avg, var
+
+
+def calculate_linearization_metric(df: pd.DataFrame, user_list: List, user_column: str, metric_name: str,
+                                   coef: Optional[float] = None) -> Tuple[pd.DataFrame, float]:
+    sales = df[
+        df[user_column].isin(user_list)
+    ].copy()
+    x = sales.groupby(user_column)[metric_name].sum()
+    y = sales.groupby(user_column)[metric_name].count()
+    if coef is None:
+        coef = np.sum(x) / np.sum(y)
+    lin = x - coef * y
+    lin = lin.reset_index()
+    lin.columns = [user_column, metric_name]
+    return lin, coef
+
